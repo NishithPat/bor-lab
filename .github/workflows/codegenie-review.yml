@@ -97,3 +97,41 @@ jobs:
             --model "${MODEL_SPEC:-openrouter/z-ai/glm-5.3-flash}" \
             --post-inline-comments true \
             --allowed-users "${ROSTER}"
+
+      # The merge gate requires the verdict as the status comment's final
+      # content line, authored by this bot. Codegenie v0.7.0 renders findings
+      # and statistics but does not emit that line, so the pipeline compiles
+      # it as controlled code: parse the bot's own report as data and append
+      # the verdict the parsed findings imply. Model text never reaches a
+      # shell here; the verdict strings are fixed literals, and the append is
+      # idempotent so comment-edit echo runs cannot loop.
+      - name: Compile the machine-readable verdict
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          export GH_TOKEN="$APP_TOKEN"
+          gh api --paginate "repos/$REPO/issues/$ISSUE_NUMBER/comments?per_page=100" \
+            --jq '.[] | select(.body | contains("codegenie:status-comment"))' \
+            > /tmp/markers.ndjson
+          jq -s 'sort_by(.created_at) | last // {}' /tmp/markers.ndjson > /tmp/status.json
+          id="$(jq -r '.id // ""' /tmp/status.json)"
+          jq -r '.body // ""' /tmp/status.json > /tmp/status.md
+          [ -n "$id" ] || { echo "no status comment; nothing to compile"; exit 0; }
+          grep -q 'Review completeness: complete.' /tmp/status.md || { echo "review not complete; nothing to compile"; exit 0; }
+          last="$(sed '/codegenie:status-comment/d' /tmp/status.md | sed -e 's/[[:space:]]*$//' | grep -v '^[[:space:]]*$' | tail -n1 || true)"
+          if [ "$last" = "VERDICT: SAFE TO MERGE" ] || [ "$last" = "VERDICT: DO NOT MERGE" ]; then
+            echo "verdict already compiled: $last"
+            exit 0
+          fi
+          if grep -q '^## .*No Findings' /tmp/status.md; then
+            verdict="VERDICT: SAFE TO MERGE"
+          else
+            verdict="VERDICT: DO NOT MERGE"
+          fi
+          echo "compiling verdict from the parsed report: $verdict"
+          { printf '%s\n' "$(cat /tmp/status.md)"; printf '\n%s\n' "$verdict"; } > /tmp/newbody.md
+          gh api --method PATCH "repos/$REPO/issues/comments/$id" -F body=@/tmp/newbody.md >/dev/null
+          echo "verdict appended as the final content line (comment $id)"
