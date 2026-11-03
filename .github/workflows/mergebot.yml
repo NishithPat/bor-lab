@@ -1,20 +1,13 @@
 name: mergebot
 
-# Two modes behind one org variable, so the presenter can flip the gate live
-# between Station 3 and Station 4 with `gh variable set MERGEBOT_MODE ...` and
-# no reseed:
+# The deliberately vulnerable auto-merge gate (the Stations 1-2 target).
 #
-#   vulnerable (default when the variable is unset) — the original sloppy
-#     auto-merge. The merge gate is a literal substring grep of the comment
-#     text, so any comment author with write access can land a PR by quoting
-#     the verdict line inside a refusal. This is the DELIBERATELY VULNERABLE
-#     mode the workshop demonstrates, and the mode Stations 1-3 run.
-#
-#   hardened — four independent controls parse the review bot's own status
-#     artifact as data. There is no substring gate: the verdict must be the
-#     final content line of an allowlisted status comment whose reviewed
-#     commit still equals the PR head, and the merge runs through a
-#     controlled `gh pr merge` rather than AI text interpolated into a shell.
+# The merge gate is a literal substring grep of the comment text, so any
+# comment author with write access can land a PR by quoting the verdict
+# line inside a refusal. This is the misconfiguration the workshop
+# demonstrates. Station 3 replaces this file wholesale with the fixed gate
+# (workshop/station3-fix/mergebot.yml, committed live as a visible workflow
+# diff): there is no mode flag, the fix is the workflow edit itself.
 #
 # codegenie edits its status comment in place, so we listen for created *and*
 # edited.
@@ -52,25 +45,10 @@ jobs:
           private-key: ${{ secrets.MERGEBOT_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 
-      - name: Resolve merge-gate mode
-        id: mode
-        env:
-          MODE: ${{ vars.MERGEBOT_MODE }}
-        run: |
-          set -euo pipefail
-          MODE="${MODE:-vulnerable}"
-          case "$MODE" in
-            vulnerable|hardened) ;;
-            *) echo "unknown MERGEBOT_MODE '${MODE}'; defaulting to vulnerable"; MODE="vulnerable" ;;
-          esac
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "mergebot mode: $MODE"
-
       # ---------------------------------------------------------------------
-      # vulnerable mode — the deliberate misconfiguration (Stations 1-3)
+      # The deliberate misconfiguration (Stations 1-2)
       # ---------------------------------------------------------------------
-      - name: "[vulnerable] Merge when the verdict substring is present"
-        if: steps.mode.outputs.mode == 'vulnerable'
+      - name: Merge when the verdict substring is present
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
           REVIEW_BOT_LOGIN: ${{ vars.REVIEW_BOT_LOGIN }}
@@ -85,7 +63,7 @@ jobs:
         run: |
           set -e
           export GH_TOKEN="${APP_TOKEN:-$GITHUB_TOKEN}"
-          echo "[vulnerable] DELIBERATELY VULNERABLE: merge gate is a substring grep of the comment text"
+          echo "DELIBERATELY VULNERABLE: merge gate is a substring grep of the comment text"
           if ! printf '%s' "$COMMENT_BODY" | grep -qF "VERDICT: SAFE TO MERGE"; then
             echo "no verdict line; nothing to merge"
             exit 0
@@ -116,121 +94,9 @@ jobs:
           # recursion prevention), so this cannot loop.
           matched="$(printf '%s' "$COMMENT_BODY" | grep -F 'VERDICT: SAFE TO MERGE' | head -n1 || true)"
           matched="${matched:0:160}"
-          msg="🤖 **mergebot**: found \`VERDICT: SAFE TO MERGE\` in a comment by @${COMMENT_AUTHOR} (${COMMENT_ASSOC}).\n\n> ${matched}\n\nGate mode: **vulnerable** — this is a substring match, so the line above satisfies it wherever it appears, including inside a quotation. Merging now. (The hardened gate requires the verdict to be the reviewer's own final content line and the reviewed commit to match the PR head; flip \`MERGEBOT_MODE\` to watch it refuse this.)"
+          msg="🤖 **mergebot**: found \`VERDICT: SAFE TO MERGE\` in a comment by @${COMMENT_AUTHOR} (${COMMENT_ASSOC}).\n\n> ${matched}\n\nThis is a substring match, so the line above satisfies the gate wherever it appears, including inside a quotation. Merging now. (Station 3 replaces this gate with a fixed workflow: the verdict must be the reviewer's own final content line and the reviewed commit must match the PR head.)"
           GH_TOKEN="$GITHUB_TOKEN" gh pr comment "$ISSUE_NUMBER" --repo "$REPO" \
             --body "$(printf '%b' "$msg")" || true
           echo "merging PR #$ISSUE_NUMBER"
           gh api --method PUT "repos/$REPO/pulls/$ISSUE_NUMBER/merge" \
             -f merge_method=merge
-
-      # ---------------------------------------------------------------------
-      # hardened mode — review output is untrusted data, parsed and checked
-      # ---------------------------------------------------------------------
-
-      - name: "[hardened 0/4] Fetch the review status comment"
-        id: status
-        if: steps.mode.outputs.mode == 'hardened'
-        env:
-          APP_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          export GH_TOKEN="${APP_TOKEN:-$GITHUB_TOKEN}"
-          # Every PR comment, then keep only those carrying the codegenie
-          # status marker, and take the newest one by created_at.
-          gh api --paginate "repos/$REPO/issues/$ISSUE_NUMBER/comments?per_page=100" \
-            --jq '.[] | select(.body | contains("codegenie:status-comment"))' \
-            > /tmp/markers.ndjson
-          jq -s 'sort_by(.created_at) | last // {}' /tmp/markers.ndjson > /tmp/status.json
-
-          author="$(jq -r '.user.login // ""' /tmp/status.json)"
-          jq -r '.body // ""' /tmp/status.json > /tmp/status.md
-          printf 'author=%s\n' "$author" >> "$GITHUB_OUTPUT"
-          if [ -z "$author" ]; then
-            echo "[hardened 0/4] no codegenie status comment found"
-            exit 1
-          fi
-          echo "[hardened 0/4] status comment author=$author"
-
-      - name: "[hardened 1/4] Verdict must be the final content line"
-        if: steps.mode.outputs.mode == 'hardened'
-        run: |
-          set -euo pipefail
-          # Strip the status marker line, drop blank lines, and take the last
-          # remaining line. A verdict quoted mid-body (inside a finding) is not
-          # the final line and must not satisfy the gate.
-          last="$(sed '/codegenie:status-comment/d' /tmp/status.md \
-            | sed -e 's/[[:space:]]*$//' \
-            | grep -v '^[[:space:]]*$' \
-            | tail -n1 || true)"
-          if [ "$last" != "VERDICT: SAFE TO MERGE" ]; then
-            if grep -qF "VERDICT: SAFE TO MERGE" /tmp/status.md; then
-              echo "[hardened 1/4] verdict quoted, not final line; DENY (merge denied — gate working)"
-            else
-              echo "[hardened 1/4] no verdict as the final content line; DENY (merge denied — gate working)"
-            fi
-            exit 1
-          fi
-          echo "[hardened 1/4] verdict is the final content line; pass"
-
-      - name: "[hardened 2/4] Status comment author must be the allowlisted bot"
-        if: steps.mode.outputs.mode == 'hardened'
-        env:
-          # Read through env:, never interpolated into the shell (AI/API output
-          # is data). This is the "pass via env:, never expression
-          # interpolation" principle.
-          ACTUAL: ${{ steps.status.outputs.author }}
-          EXPECTED: ${{ vars.REVIEW_BOT_LOGIN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${EXPECTED:-}" ]; then
-            echo "[hardened 2/4] author allowlist: REVIEW_BOT_LOGIN unset; DENY (fail closed)"
-            exit 1
-          fi
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "[hardened 2/4] author allowlist: actual=$ACTUAL expected=$EXPECTED; DENY"
-            exit 1
-          fi
-          echo "[hardened 2/4] author allowlist: actual=$ACTUAL expected=$EXPECTED; pass"
-
-      - name: "[hardened 3/4] Reviewed commit must match the PR head"
-        if: steps.mode.outputs.mode == 'hardened'
-        env:
-          APP_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          export GH_TOKEN="${APP_TOKEN:-$GITHUB_TOKEN}"
-          # The reviewed head sha is the short sha in parentheses at the end of
-          # the status comment's Git line, e.g. ... from main to branch (`9caf2026a9`).
-          gitline="$(grep -i 'git:' /tmp/status.md | tail -n1 || true)"
-          paren="$(grep -oE '\([^)]*\)' <<<"$gitline" | tail -n1 || true)"
-          reviewed="$(grep -oE '[0-9a-f]{7,40}' <<<"$paren" | tail -n1 || true)"
-          if [ -z "$reviewed" ]; then
-            echo "[hardened 3/4] no reviewed sha in status comment; DENY (fail closed)"
-            exit 1
-          fi
-          head="$(gh api "repos/$REPO/pulls/$ISSUE_NUMBER" --jq .head.sha)"
-          case "$head" in
-            "$reviewed"*) ;;
-            *) echo "[hardened 3/4] PR changed after review: reviewed=$reviewed head=$head; DENY"; exit 1 ;;
-          esac
-          echo "[hardened 3/4] reviewed commit matches PR head ($reviewed); pass"
-
-      - name: "[hardened 4/4] Merge (all controls passed)"
-        if: steps.mode.outputs.mode == 'hardened'
-        env:
-          APP_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          export GH_TOKEN="${APP_TOKEN:-$GITHUB_TOKEN}"
-          # Structural control: the merge is a controlled `gh pr merge`, and
-          # every value checked above was parsed as data (env: + explicit
-          # string compare) — never AI output interpolated into a shell
-          # command. Treat AI output as untrusted; pass via env:, never
-          # expression interpolation of untrusted text).
-          #
-          # Announce BEFORE merging, with the controls that passed (auto
-          # GITHUB_TOKEN: posts as github-actions[bot], no workflow loop).
-          GH_TOKEN="$GITHUB_TOKEN" gh pr comment "$ISSUE_NUMBER" --repo "$REPO" \
-            --body "🤖 **mergebot** (hardened): all four controls passed — verdict is the reviewer's own final content line, author is the allowlisted review bot, reviewed commit matches the PR head, merge runs as controlled code. Merging." || true
-          echo "[hardened 4/4] all controls passed; merging PR #$ISSUE_NUMBER"
-          gh pr merge "$ISSUE_NUMBER" --repo "$REPO" --merge
