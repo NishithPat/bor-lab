@@ -72,3 +72,14 @@ blocks while draining a simulated mempool.
 The only third-party dependency is `github.com/spf13/cobra` for the command
 tree. Everything else is the standard library. `go.sum` is committed so builds
 are reproducible offline after the module cache is populated.
+
+## Building and testing
+
+The project builds and tests with the standard Go toolchain:
+
+```
+go build ./...
+go test ./...
+```
+
+Both commands are also what CI runs on every push to `main`.
