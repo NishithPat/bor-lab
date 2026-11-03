@@ -55,8 +55,12 @@ jobs:
               + "dashboard regex can match it.\n\n"
               + "Issue title: " + $title + "\n"
               + "Issue body:\n" + $body)')"
+          # 8000, not 2000: the current reasoning-capable route spends small
+          # budgets on hidden reasoning and returns empty content; the
+          # verdict then never exists (the "silence" in the payload doc's
+          # attempt-3 data was this, not a choice).
           req="$(jq -n --arg model "$model" --arg prompt "$prompt" \
-            '{model:$model, max_tokens:2000,
+            '{model:$model, max_tokens:8000,
               messages:[{role:"user",content:$prompt}]}')"
           response="$(curl -fsS https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer $LLM_KEY" \

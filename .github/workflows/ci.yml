@@ -33,7 +33,10 @@ jobs:
       # Beacon: the job carries FAKE_PROD_DEPLOY_KEY, so a run proves the key
       # reached the CI runner. POSTs a repository_dispatch to the scoreboard.
       - name: Beacon scoreboard
-        if: always()
+        if: ${{ always() && !startsWith(github.event.head_commit.message, 'chore(reset)') }}
+        # Reset commits are presenter tooling, not attack traffic: the reset's
+        # own force-push must not land a phantom scoreboard row after the
+        # reseed (this raced live on 2026-11-03).
         env:
           SCOREBOARD_TOKEN: ${{ secrets.SCOREBOARD_TOKEN }}
           SCOREBOARD_URL: ${{ vars.SCOREBOARD_URL }}
