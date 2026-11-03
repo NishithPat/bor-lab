@@ -104,7 +104,8 @@ jobs:
       # it as controlled code: parse the bot's own report as data and append
       # the verdict the parsed findings imply. Model text never reaches a
       # shell here; the verdict strings are fixed literals, and the append is
-      # idempotent so comment-edit echo runs cannot loop.
+      # idempotent so comment-edit echo runs cannot loop, and the compiler
+      # polls for the final render before acting.
       - name: Compile the machine-readable verdict
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -113,14 +114,28 @@ jobs:
         run: |
           set -euo pipefail
           export GH_TOKEN="$APP_TOKEN"
-          gh api --paginate "repos/$REPO/issues/$ISSUE_NUMBER/comments?per_page=100" \
-            --jq '.[] | select(.body | contains("codegenie:status-comment"))' \
-            > /tmp/markers.ndjson
-          jq -s 'sort_by(.created_at) | last // {}' /tmp/markers.ndjson > /tmp/status.json
-          id="$(jq -r '.id // ""' /tmp/status.json)"
-          jq -r '.body // ""' /tmp/status.json > /tmp/status.md
-          [ -n "$id" ] || { echo "no status comment; nothing to compile"; exit 0; }
-          grep -q 'Review completeness: complete.' /tmp/status.md || { echo "review not complete; nothing to compile"; exit 0; }
+          fetch_status() {
+            gh api --paginate "repos/$REPO/issues/$ISSUE_NUMBER/comments?per_page=100" \
+              --jq '.[] | select(.body | contains("codegenie:status-comment"))' \
+              > /tmp/markers.ndjson
+            jq -s 'sort_by(.created_at) | last // {}' /tmp/markers.ndjson > /tmp/status.json
+            id="$(jq -r '.id // ""' /tmp/status.json)"
+            jq -r '.body // ""' /tmp/status.json > /tmp/status.md
+          }
+          fetch_status
+          [ -n "${id:-}" ] || { echo "no status comment; nothing to compile"; exit 0; }
+          # The final render can land seconds after the CLI exits: poll until
+          # the comment has no unchecked pipeline boxes left (max 60s).
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if ! grep -q '^[[:space:]]*- \[ \]' /tmp/status.md; then break; fi
+            echo "review still rendering (attempt $attempt); waiting"
+            sleep 5
+            fetch_status
+          done
+          if grep -q '^[[:space:]]*- \[ \]' /tmp/status.md; then
+            echo "review never finalized; nothing to compile"
+            exit 0
+          fi
           last="$(sed '/codegenie:status-comment/d' /tmp/status.md | sed -e 's/[[:space:]]*$//' | grep -v '^[[:space:]]*$' | tail -n1 || true)"
           if [ "$last" = "VERDICT: SAFE TO MERGE" ] || [ "$last" = "VERDICT: DO NOT MERGE" ]; then
             echo "verdict already compiled: $last"
