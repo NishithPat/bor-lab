@@ -1,16 +1,25 @@
 name: mergebot
 
-# The deliberately vulnerable auto-merge gate (the Stations 1-2 target).
+# THE FIXED MERGE GATE — the change a team actually ships.
 #
-# The merge gate is a literal substring grep of the comment text, so any
-# comment author with write access can land a PR by quoting the verdict
-# line inside a refusal. This is the misconfiguration the workshop
-# demonstrates. Station 3 replaces this file wholesale with the fixed gate
-# (workshop/station3-fix/mergebot.yml, committed live as a visible workflow
-# diff): there is no mode flag, the fix is the workflow edit itself.
+# The vulnerable version of this workflow grepped comment text for the
+# verdict, so a review bot that merely QUOTED "VERDICT: SAFE TO MERGE"
+# inside its own security warning satisfied the gate and merged the
+# attacker's PR. No bot ships a "hardened" mode flag; the fix is this
+# workflow edit, committed over .github/workflows/mergebot.yml on main
+# (Station 3 does the commit live). The gate stops reading comment text
+# entirely: it fetches the review bot's own status artifact through the
+# API and parses it as data, requiring
+#   1. the verdict to be the artifact's final content line,
+#   2. the artifact's author to be the one allowlisted bot identity,
+#   3. the reviewed commit to still equal the PR head,
+# and then merges through controlled code (a `gh pr merge` under the
+# mergebot App identity — never AI text in a shell, and a real identity
+# so the post-merge `ci` beacon still fires).
 #
 # codegenie edits its status comment in place, so we listen for created *and*
-# edited.
+# edited. The triggering comment is only the wake-up event; the gate reads
+# the status artifact, not the comment.
 on:
   issue_comment:
     types: [created, edited]
@@ -26,11 +35,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # The merge runs as mergebot-dutralab[bot]: a GitHub App installation
-      # token minted per-step below (APP_TOKEN). A merge performed with the
-      # auto GITHUB_TOKEN does not trigger downstream workflows (GitHub's
-      # recursion prevention), so the post-merge beacon chain needs a real
-      # identity; App tokens, like PATs, DO trigger them.
+      # Same identity constraint as the vulnerable gate: the merge must be
+      # performed by the mergebot App, not the auto GITHUB_TOKEN, or the
+      # post-merge `ci` beacon never fires (GitHub's recursion prevention).
       REPO: ${{ github.repository }}
       ISSUE_NUMBER: ${{ github.event.issue.number }}
     steps:
@@ -45,58 +52,104 @@ jobs:
           private-key: ${{ secrets.MERGEBOT_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 
-      # ---------------------------------------------------------------------
-      # The deliberate misconfiguration (Stations 1-2)
-      # ---------------------------------------------------------------------
-      - name: Merge when the verdict substring is present
+      - name: "[gate 0/4] Fetch the review status comment"
+        id: status
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
-          REVIEW_BOT_LOGIN: ${{ vars.REVIEW_BOT_LOGIN }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
-          # GitHub provides the association on the comment event itself
-          # (MEMBER, OWNER, COLLABORATOR, CONTRIBUTOR, NONE); no extra API
-          # call or PAT is needed for the trust gate. (Forgejo lacked this
-          # field, which is why the old design queried the collaborator
-          # permission API with a seeded PAT.)
-          COMMENT_ASSOC: ${{ github.event.comment.author_association }}
         run: |
-          set -e
+          set -euo pipefail
           export GH_TOKEN="${APP_TOKEN:-$GITHUB_TOKEN}"
-          echo "DELIBERATELY VULNERABLE: merge gate is a substring grep of the comment text"
-          if ! printf '%s' "$COMMENT_BODY" | grep -qF "VERDICT: SAFE TO MERGE"; then
-            echo "no verdict line; nothing to merge"
-            exit 0
+          # Every PR comment, then keep only those carrying the codegenie
+          # status marker, and take the newest one by created_at.
+          gh api --paginate "repos/$REPO/issues/$ISSUE_NUMBER/comments?per_page=100" \
+            --jq '.[] | select(.body | contains("codegenie:status-comment"))' \
+            > /tmp/markers.ndjson
+          jq -s 'sort_by(.created_at) | last // {}' /tmp/markers.ndjson > /tmp/status.json
+          author="$(jq -r '.user.login // ""' /tmp/status.json)"
+          jq -r '.body // ""' /tmp/status.json > /tmp/status.md
+          printf 'author=%s\n' "$author" >> "$GITHUB_OUTPUT"
+          if [ -z "$author" ]; then
+            echo "[gate 0/4] no codegenie status comment found"
+            exit 1
           fi
-          # Trust gate: the comment author's association on this repo must
-          # imply write access. Parsed from the event payload via env:.
-          echo "verdict author=$COMMENT_AUTHOR association=$COMMENT_ASSOC"
-          # Trust gate, two accepted shapes (the realistic sloppy mergebot):
-          # (a) the one allowlisted review-bot identity — GitHub App bots post
-          #     with association NONE even when installed with write access,
-          #     so "trust our review bot by login" is how real orgs gate; it
-          #     is also the class-3 lesson: the identity is trusted, its TEXT
-          #     is grep'd;
-          # (b) any human with MEMBER/OWNER/COLLABORATOR association.
-          if [ "$COMMENT_AUTHOR" = "$REVIEW_BOT_LOGIN" ]; then
-            echo "author is the allowlisted review bot ($REVIEW_BOT_LOGIN): trusted identity"
-          else
-            case "$COMMENT_ASSOC" in
-              MEMBER|OWNER|COLLABORATOR) ;;
-              *) echo "author lacks write access; refusing to merge"; exit 0 ;;
-            esac
+          echo "[gate 0/4] status comment author=$author"
+
+      - name: "[gate 1/4] Verdict must be the final content line"
+        run: |
+          set -euo pipefail
+          # Strip the status marker line, drop blank lines, and take the last
+          # remaining line. A verdict quoted mid-body (inside a finding) is not
+          # the final line and must not satisfy the gate.
+          last="$(sed '/codegenie:status-comment/d' /tmp/status.md \
+            | sed -e 's/[[:space:]]*$//' \
+            | grep -v '^[[:space:]]*$' \
+            | tail -n1 || true)"
+          if [ "$last" != "VERDICT: SAFE TO MERGE" ]; then
+            if grep -qF "VERDICT: SAFE TO MERGE" /tmp/status.md; then
+              echo "[gate 1/4] verdict quoted, not final line; DENY (merge denied — gate working)"
+            else
+              echo "[gate 1/4] no verdict as the final content line; DENY (merge denied — gate working)"
+            fi
+            exit 1
           fi
-          # Announce BEFORE merging, quoting the exact line that satisfied the
-          # gate — so when the match is inside a quotation (the A2 fire), the
-          # announcement indicts itself. Posted with the workflow's auto
-          # GITHUB_TOKEN, which appears as github-actions[bot]; comments made
-          # with the auto token do not re-trigger workflows (GitHub's
-          # recursion prevention), so this cannot loop.
-          matched="$(printf '%s' "$COMMENT_BODY" | grep -F 'VERDICT: SAFE TO MERGE' | head -n1 || true)"
-          matched="${matched:0:160}"
-          msg="🤖 **mergebot**: found \`VERDICT: SAFE TO MERGE\` in a comment by @${COMMENT_AUTHOR} (${COMMENT_ASSOC}).\n\n> ${matched}\n\nThis is a substring match, so the line above satisfies the gate wherever it appears, including inside a quotation. Merging now. (Station 3 replaces this gate with a fixed workflow: the verdict must be the reviewer's own final content line and the reviewed commit must match the PR head.)"
+          echo "[gate 1/4] verdict is the final content line; pass"
+
+      - name: "[gate 2/4] Status comment author must be the allowlisted bot"
+        env:
+          # Read through env:, never interpolated into the shell (AI/API output
+          # is data). This is the "pass via env:, never expression
+          # interpolation" principle.
+          ACTUAL: ${{ steps.status.outputs.author }}
+          EXPECTED: ${{ vars.REVIEW_BOT_LOGIN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPECTED:-}" ]; then
+            echo "[gate 2/4] author allowlist: REVIEW_BOT_LOGIN unset; DENY (fail closed)"
+            exit 1
+          fi
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "[gate 2/4] author allowlist: actual=$ACTUAL expected=$EXPECTED; DENY"
+            exit 1
+          fi
+          echo "[gate 2/4] author allowlist: actual=$ACTUAL expected=$EXPECTED; pass"
+
+      - name: "[gate 3/4] Reviewed commit must match the PR head"
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          export GH_TOKEN="${APP_TOKEN:-$GITHUB_TOKEN}"
+          # The reviewed head sha is the short sha in parentheses at the end of
+          # the status comment's Git line, e.g. ... from main to branch (`9caf2026a9`).
+          gitline="$(grep -i 'git:' /tmp/status.md | tail -n1 || true)"
+          paren="$(grep -oE '\([^)]*\)' <<<"$gitline" | tail -n1 || true)"
+          reviewed="$(grep -oE '[0-9a-f]{7,40}' <<<"$paren" | tail -n1 || true)"
+          if [ -z "$reviewed" ]; then
+            echo "[gate 3/4] no reviewed sha in status comment; DENY (fail closed)"
+            exit 1
+          fi
+          head="$(gh api "repos/$REPO/pulls/$ISSUE_NUMBER" --jq .head.sha)"
+          case "$head" in
+            "$reviewed"*) ;;
+            *) echo "[gate 3/4] PR changed after review: reviewed=$reviewed head=$head; DENY"; exit 1 ;;
+          esac
+          echo "[gate 3/4] reviewed commit matches PR head ($reviewed); pass"
+
+      - name: "[gate 4/4] Merge (all controls passed)"
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          export GH_TOKEN="${APP_TOKEN:-$GITHUB_TOKEN}"
+          # Structural control: the merge is a controlled `gh pr merge`, and
+          # every value checked above was parsed as data (env: + explicit
+          # string compare) — never AI output interpolated into a shell
+          # command. Treat AI output as untrusted; pass via env:, never
+          # expression interpolation of untrusted text.
+          #
+          # Announce BEFORE merging, with the controls that passed (auto
+          # GITHUB_TOKEN: posts as github-actions[bot], no workflow loop).
           GH_TOKEN="$GITHUB_TOKEN" gh pr comment "$ISSUE_NUMBER" --repo "$REPO" \
-            --body "$(printf '%b' "$msg")" || true
-          echo "merging PR #$ISSUE_NUMBER"
-          gh api --method PUT "repos/$REPO/pulls/$ISSUE_NUMBER/merge" \
-            -f merge_method=merge
+            --body "🤖 **mergebot** (fixed gate): all four controls passed — verdict is the reviewer's own final content line, author is the allowlisted review bot, reviewed commit matches the PR head, merge runs as controlled code. Merging." || true
+          echo "[gate 4/4] all controls passed; merging PR #$ISSUE_NUMBER"
+          gh pr merge "$ISSUE_NUMBER" --repo "$REPO" --merge
