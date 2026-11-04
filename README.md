@@ -69,6 +69,6 @@ blocks while draining a simulated mempool.
 
 ## Dependencies
 
-The only third-party dependency is `github.com/spf13/cobra`, used for the command
+The only third-party dependency is `github.com/spf13/cobra` for the command
 tree. Everything else is the standard library. `go.sum` is committed so builds
 are reproducible offline after the module cache is populated.
